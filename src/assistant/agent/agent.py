@@ -5,9 +5,10 @@ import re
 from collections.abc import Callable
 from decimal import Decimal
 
+from assistant.agent.parts import current_part, current_request
 from assistant.agent.tools import TOOL_SCHEMAS
 from assistant.infra.erp_client import ErpUnavailable
-from assistant.infra.grounding import find_codes, normalize_code
+from assistant.infra.grounding import code_type, find_codes, normalize_code
 from assistant.infra.llm import LLMClient, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
@@ -74,12 +75,32 @@ def _execute(function: Callable[..., dict], arguments: dict) -> dict:
     return {"error": ERP_FAILURE}
 
 
+def _step_evidence(step: ToolStep) -> dict | None:
+    """Отделяет факты поиска от текста модели; ошибки не подтверждают ничего."""
+    result = step.result
+    if step.error or not result or result.get("error"):
+        return None
+    if step.tool == "search_knowledge":
+        if "verified_facts" in result:
+            # Поле формирует build_tools после сверки с kb.graph.
+            facts = result["verified_facts"]
+        elif not result.get("refused"):
+            # Совместимость с подставными инструментами старого контракта.
+            facts = result.get("facts", [])
+        else:
+            facts = []
+        return {"facts": facts} if facts else None
+    if result.get("refused"):
+        return None
+    return {key: value for key, value in result.items() if key != "sources"}
+
+
 def _answer_errors(text: str, question: str, steps: list[ToolStep]) -> list[str]:
     """Сверяет коды и числа с вопросом и результатами, исключая ошибки и источники."""
     results = []
     for step in steps:
-        if step.error is None and step.result and not step.result.get("refused"):
-            result = {key: value for key, value in step.result.items() if key != "sources"}
+        result = _step_evidence(step)
+        if result:
             # Номер строки — оформление, а не числовой факт. Сами результаты шагов не меняем.
             if isinstance(result.get("answer"), str):
                 result["answer"] = re.sub(r"(?m)^\s*\d+[.)]\s+", "", result["answer"])
@@ -101,6 +122,32 @@ def _answer_errors(text: str, question: str, steps: list[ToolStep]) -> list[str]
         errors.append("Цена не подтверждена данными о цене.")
     if _quantities(text) - quantities:
         errors.append("Количество не подтверждено данными о количестве.")
+    if re.search(r"какие.*детал", question, re.IGNORECASE) and re.search(r"снят", question, re.IGNORECASE):
+        listed = {code for step in steps if step.tool == "summarize_topic" and not step.error
+                  and step.result and not step.result.get("refused")
+                  for code in find_codes(step.result.get("answer", "")) if code_type(code) == "Part"}
+        if listed - set(find_codes(text)) and "не найдено" not in text.lower():
+            errors.append("Сохрани весь перечень деталей из ответа summarize_topic, включая промежуточные замены.")
+    if current_request(question) and "не найдено" not in text.lower():
+        facts = [fact for result in results for fact in result.get("facts", [])]
+        part, suppliers, problem = current_part(question, facts)
+        if problem:
+            errors.append(problem)
+        elif part:
+            mentioned = {code for code in find_codes(text) if code_type(code) == "Part"}
+            if mentioned and part not in mentioned:
+                errors.append(f"Ответ должен назвать актуальную деталь {part}, а не только старую.")
+            for sentence in re.split(r"[;\n]|(?<=[.!?])\s+", text):
+                named = {code for code in find_codes(sentence) if code_type(code) == "Part"}
+                recommendation = re.search(r"закаж|заказ|рекоменд|нужн", sentence, re.IGNORECASE)
+                history = re.search(r"снят|ранее|раньше|предшествен|заменена|не\s+.*заказ", sentence, re.IGNORECASE)
+                if named and part not in named and recommendation and not history:
+                    errors.append(f"Нельзя рекомендовать старую деталь вместо {part}.")
+                    break
+            if re.search(r"постав", question, re.IGNORECASE) and not any(
+                name.lower() in text.lower() for name in suppliers
+            ):
+                errors.append(f"Поставщик актуальной детали {part} не подтверждён.")
     # В простом предложении с одной деталью числа должны относиться именно к ней.
     for sentence in re.split(r"[;\n]|(?<=[.!?])\s+", text):
         parts = {code for code in find_codes(sentence) if code.startswith("P-")}
@@ -128,8 +175,20 @@ def _answer_errors(text: str, question: str, steps: list[ToolStep]) -> list[str]
             if "заказ" not in sentence:
                 continue
             status = r"(?:создан[аоы]?|оформлен[аоы]?|подтвержд[её]н[аоы]?)\b"
-            if re.search(rf"\b{status}", sentence) and not re.search(rf"\bне\s+{status}", sentence):
-                errors.append("Статус заказа не подтверждён: инструмент создания заказа не выполнялся успешно.")
+            for match in re.finditer(rf"\b{status}", sentence):
+                # Проверяем каждое утверждение отдельно: будущее или отрицание
+                # одного статуса не оправдывает другой уже выполненный статус.
+                prefix = sentence[:match.start()]
+                not_completed = re.search(
+                    r"\b(?:не|будет|будут|может быть|могут быть|был бы|была бы|было бы|были бы)"
+                    r"\s+(?:заказ\w*\s+)?$", prefix,
+                )
+                if not not_completed:
+                    errors.append("Статус заказа не подтверждён: инструмент создания заказа не выполнялся успешно.")
+                    break
+            else:
+                continue
+            if errors:
                 break
     return errors
 
@@ -152,7 +211,7 @@ def _finish(text: str, question: str, steps: list[ToolStep], messages: list[dict
             text += "\n" + ERP_FAILURE
         errors = _answer_errors(text, question, steps)
         if not errors:
-            has_data = any(step.error is None and step.result and not step.result.get("refused") for step in steps)
+            has_data = any(_step_evidence(step) for step in steps)
             refused = "не найдено" in text.lower() or not has_data
             return AgentResult(text, steps=steps, sources=sorted(sources), refused=refused)
         if attempt == 0:
@@ -204,6 +263,10 @@ def run_agent(
                 "Подбирай деталь только с привязкой HAS_PART к указанной модели и с учётом замен. "
                 "Для просьбы оформить заказ вызови create_service_order: программа сама запросит подтверждение. "
                 "Не заявляй, что заказ создан, оформлен или подтверждён, по одному получению цены и остатка."
+                " В поисковых подзапросах сохраняй цель исходного вопроса: подбор актуальной детали, "
+                "поставщик, цена или подготовка заказа, а не только значение ошибки. "
+                "verified_facts — проверенные связи графа; используй их даже при refused=True у текста поиска. "
+                "Отсутствие регламента в выбранных фактах не доказывает его отсутствие во всей базе."
             ),
         },
         {"role": "user", "content": question},
@@ -216,6 +279,7 @@ def run_agent(
     replacement_reminder_sent = False
     price_reminder_sent = False
     supplier_reminder_sent = False
+    current_reminder_sent = False
     specific_question = bool(find_codes(question)) and not re.search(
         r"чаще|больше|сравн|какие|каких|всех", question, flags=re.IGNORECASE
     )
@@ -223,16 +287,30 @@ def run_agent(
         response = llm.chat(messages, tools=TOOL_SCHEMAS)
         messages.append(response.as_message())
         if not response.tool_calls:
+            facts = [fact for step in steps if (evidence := _step_evidence(step))
+                     for fact in evidence.get("facts", [])]
+            part, suppliers, problem = current_part(question, facts)
+            mentioned = {code for code in find_codes(response.content) if code_type(code) == "Part"}
+            if current_request(question) and part and mentioned and part not in mentioned and not current_reminder_sent:
+                current_reminder_sent = True
+                messages.append({"role": "user", "content": (
+                    f"По полученным связям последняя замена — {part}. Сохрани цель исходного вопроса. "
+                    "Для актуального подбора называй эту деталь; старую можно упомянуть только как предшественницу."
+                )})
+                continue
             asks_supplier = re.search(r"постав", question, flags=re.IGNORECASE)
             supplier_found = any(step.error is None and step.result and not step.result.get("refused")
                                  and any("SUPPLIED_BY" in fact for fact in step.result.get("facts", []))
                                  for step in steps)
+            if current_request(question) and (part or problem):
+                supplier_found = bool(suppliers) and not problem
             if asks_supplier and steps and not supplier_found and not supplier_reminder_sent:
                 supplier_reminder_sent = True
                 messages.append({"role": "user", "content": (
                     "Поставщик ещё не найден. Сначала установи деталь нужной модели и последнюю замену, "
                     "затем вызови search_knowledge с конкретным номером актуальной детали и вопросом о поставщике. "
-                    "Повторяй только номера из исходного вопроса или полученных фактов; не придумывай их."
+                    "Повторяй только номера из исходного вопроса или полученных фактов; не придумывай их. "
+                    + (f"Актуальная деталь — {part}. Ищи её поставщика по этому коду." if part else "")
                 )})
                 continue
             checked_parts = [step.result["part_id"] for step in steps
@@ -303,6 +381,13 @@ def run_agent(
                 model = arguments["model"]
                 if re.fullmatch(r"(?:AR|BZ|GS)-[0-9]{3}", model) is None or model not in find_codes(question):
                     error = "Для заказа пользователь должен указать код модели оборудования в исходном вопросе."
+                facts = [fact for previous in steps[:-1] if (evidence := _step_evidence(previous))
+                         for fact in evidence.get("facts", [])]
+                part, _, problem = current_part(question, facts)
+                if problem:
+                    error = problem
+                elif part and arguments["part_id"] != part:
+                    error = f"Для нового заказа нужна актуальная деталь {part}."
             if error:
                 step.error = error
                 step.result = {"error": error}
@@ -330,8 +415,8 @@ def run_agent(
             step.result = cache[key]
             step.error = step.result.get("error")
             messages.append(tool_message(call, step.result))
-            if not step.error and not step.result.get("refused"):
-                evidence = {key: value for key, value in step.result.items() if key != "sources"}
+            evidence = _step_evidence(step)
+            if evidence:
                 known_codes.update(find_codes(json.dumps(evidence, ensure_ascii=False)))
 
     learned = []
@@ -339,7 +424,11 @@ def run_agent(
         if step.error or not step.result:
             continue
         result = step.result
-        if result.get("answer"):
+        if step.tool == "search_knowledge" and result.get("refused"):
+            evidence = _step_evidence(step)
+            if evidence:
+                learned.extend(evidence["facts"])
+        elif result.get("answer"):
             learned.append(result["answer"])
         if "price_rub" in result:
             learned.append(f"{result['part_id']}: цена {result['price_rub']} руб.")

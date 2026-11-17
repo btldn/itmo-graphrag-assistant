@@ -2,7 +2,10 @@
 
 import json
 
+import pytest
+
 from assistant.agent.agent import _answer_errors, run_agent
+from assistant.agent.parts import current_part
 from assistant.agent.tools import build_tools
 from assistant.graphrag.communities import summarize_community
 from assistant.graphrag.extraction import _explicit_relations, extract_chunk
@@ -329,3 +332,217 @@ def test_quantities_cannot_be_swapped_between_parts():
     ]
     assert _answer_errors("P-1042B: остаток 8. P-2054C: остаток 3.", "Проверь остатки", steps)
     assert not _answer_errors("P-1042B: остаток 3. P-2054C: остаток 8.", "Проверь остатки", steps)
+
+
+@pytest.mark.parametrize("text", [
+    "После подтверждения этих данных, будет создан заказ.",
+    "Если подтвердите, заказ будет оформлен.",
+    "После подтверждения будет заказ создан.",
+    "Заказ может быть создан после подтверждения.",
+    "Заказ был бы создан после подтверждения.",
+    "Заказ не создан.",
+])
+def test_future_or_negated_order_status_is_not_a_completed_order(text):
+    assert not _answer_errors(text, "Проверь данные", [])
+
+
+@pytest.mark.parametrize("text", [
+    "Заказ создан.",
+    "Заказ уже оформлен.",
+    "Заказ подтверждён.",
+    "Заказ создан; доставка будет завтра.",
+    "Заказ будет создан, а другой заказ уже оформлен.",
+    "Заказ не создан, но оформлен.",
+])
+def test_future_or_negation_does_not_hide_another_completed_status(text):
+    assert _answer_errors(text, "Проверь данные", [])
+
+
+def test_future_order_status_does_not_trigger_an_unnecessary_correction():
+    text = "На складе 3 шт. После подтверждения этих данных, будет создан заказ."
+    tools = Tools()
+    llm = FakeLLM([call("check_stock", part_id="P-1042B", warehouse="Казань"), text])
+    result = run_agent("Проверь P-1042B в Казани", llm, tools.as_dict())
+    assert result.answer == text and not result.refused
+    assert len(llm.requests) == 2 and tools.count("create_service_order") == 0
+
+
+def test_refused_search_still_allows_graph_part_to_reach_erp(kb, erp):
+    tools = build_tools(kb, FakeLLM(["В базе знаний не найдено прямого регламента."]), erp)
+    llm = FakeLLM([
+        call("search_knowledge", question="Деталь для AR-210 при E-17"),
+        call("get_price", part_id="P-1042B"),
+        "Цена P-1042B: 2630 руб.",
+    ])
+    result = run_agent("Подбери деталь для AR-210 при E-17 и узнай цену", llm, tools)
+    assert erp.calls == [("get_price", "P-1042B")]
+    assert not result.refused and result.steps[0].result["refused"]
+    assert not result.steps[1].error
+
+
+def test_refused_search_graph_facts_can_support_final_answer(kb, erp):
+    tools = build_tools(kb, FakeLLM(["В базе знаний не найдено прямого регламента."]), erp)
+    llm = FakeLLM([
+        call("search_knowledge", question="Деталь для AR-210 при E-17"),
+        "Замена — P-1042B.",
+    ])
+    result = run_agent("Подбери деталь для AR-210 при E-17", llm, tools)
+    assert not result.refused and result.answer == "Замена — P-1042B."
+    assert "bulletin_SB-2025-03.md" in result.sources
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_unverified_search_text_cannot_authorize_erp(refused):
+    tools = Tools(search_knowledge={
+        "answer": "Деталь P-7777.", "facts": [], "sources": [], "refused": refused,
+    })
+    llm = FakeLLM([
+        call("search_knowledge", question="Деталь для AR-210"),
+        call("get_price", part_id="P-7777"),
+        "В базе знаний не найдено.",
+    ])
+    result = run_agent("Найди деталь для AR-210", llm, tools.as_dict())
+    assert tools.count("get_price") == 0 and result.steps[1].error
+
+
+def test_refused_unverified_facts_do_not_authorize_erp():
+    tools = Tools(search_knowledge={
+        "answer": "В базе знаний не найдено.", "facts": ["P-7777 -IS_A-> пусковое реле"],
+        "sources": [], "refused": True,
+    })
+    llm = FakeLLM([
+        call("search_knowledge", question="Деталь для AR-210"),
+        call("get_price", part_id="P-7777"),
+        "В базе знаний не найдено.",
+    ])
+    result = run_agent("Найди деталь для AR-210", llm, tools.as_dict())
+    assert tools.count("get_price") == 0 and result.steps[1].error
+
+
+def test_verified_search_facts_are_checked_against_graph(kb, erp, monkeypatch):
+    from assistant.infra.schemas import Answer
+
+    monkeypatch.setattr("assistant.agent.tools.local_search", lambda *args: Answer(
+        "Деталь P-7777.", facts=[
+            "1. P-1042 -REPLACED_BY-> P-1042B",
+            "2. P-1042 -REPLACED_BY-> P-7777",
+            "3. P-1042B -REPLACED_BY-> P-1042",
+        ], refused=True,
+    ))
+    result = build_tools(kb, FakeLLM([]), erp)["search_knowledge"]("Деталь для AR-210")
+    assert result["verified_facts"] == ["P-1042 -REPLACED_BY-> P-1042B"]
+
+
+@pytest.mark.parametrize("search_result", [
+    {"answer": "Описание", "facts": [], "sources": ["P-7777.md"], "refused": False},
+    {"error": "Поиск недоступен", "verified_facts": ["P-7777 -IS_A-> пусковое реле"]},
+])
+def test_sources_or_failed_search_cannot_authorize_erp(search_result):
+    tools = Tools(search_knowledge=search_result)
+    llm = FakeLLM([
+        call("search_knowledge", question="Деталь для AR-210"),
+        call("get_price", part_id="P-7777"),
+        "В базе знаний не найдено.",
+    ])
+    result = run_agent("Найди деталь для AR-210", llm, tools.as_dict())
+    assert tools.count("get_price") == 0 and result.steps[1].error
+
+
+def test_search_text_alone_cannot_confirm_final_code():
+    steps = [ToolStep("search_knowledge", {}, result={
+        "answer": "Деталь P-7777", "facts": [], "verified_facts": [], "refused": False,
+    })]
+    assert _answer_errors("Нужна P-7777.", "Подбери деталь", steps)
+
+
+def test_graph_facts_from_refused_search_can_prepare_pending_order(kb, erp):
+    tools = build_tools(kb, FakeLLM(["В базе знаний не найдено регламента."]), erp)
+    llm = FakeLLM([
+        call("search_knowledge", question="Подбери деталь для AR-210 при E-17"),
+        call("create_service_order", **ORDER),
+    ])
+    result = run_agent("Оформи заказ: 2 штуки для AR-210 при E-17, склад Казань.", llm, tools)
+    assert result.needs_confirmation and result.pending_action == {"tool": "create_service_order", "args": ORDER}
+    assert erp.calls == []
+
+
+def test_current_part_follows_two_replacements_and_uses_final_supplier():
+    facts = ["BZ-999 -HAS_PART-> P-9000", "P-9000 -IS_A-> контроллер",
+             "E-88 -INDICATES-> контроллер", "P-9000 -REPLACED_BY-> P-9000B",
+             "P-9000B -REPLACED_BY-> P-9000C", "P-9000 -SUPPLIED_BY-> Старый",
+             "P-9000C -SUPPLIED_BY-> Новый", "BZ-998 -HAS_PART-> P-9900",
+             "P-9900 -IS_A-> контроллер"]
+    assert current_part("Какую деталь заказать для BZ-999 при E-88?", facts) == ("P-9000C", ["Новый"], None)
+
+
+@pytest.mark.parametrize("links", [
+    ["P-9000 -REPLACED_BY-> P-9000B", "P-9000B -REPLACED_BY-> P-9000"],
+    ["P-9000 -REPLACED_BY-> P-9000B", "P-9000 -REPLACED_BY-> P-9000C"],
+])
+def test_current_part_does_not_choose_from_cycle_or_branch(links):
+    part, suppliers, error = current_part("Чем заменить P-9000?", links)
+    assert part is None and not suppliers and error
+
+
+def test_old_recommendation_is_rejected_but_history_is_allowed():
+    steps = [ToolStep("search_knowledge", {}, result={"facts": [
+        "P-9000 -REPLACED_BY-> P-9000B", "P-9000B -REPLACED_BY-> P-9000C",
+    ], "refused": False})]
+    assert _answer_errors("Закажите P-9000.", "Какую замену P-9000 заказать?", steps)
+    assert not _answer_errors("Раньше стояла P-9000.", "Что стояло раньше вместо P-9000?", steps)
+    assert not _answer_errors("P-9000 заменена на P-9000B, затем на P-9000C.",
+                              "Какую замену P-9000 заказать?", steps)
+
+
+def test_supplier_of_old_part_cannot_answer_current_supplier_question():
+    steps = [ToolStep("search_knowledge", {}, result={"facts": [
+        "P-9000 -REPLACED_BY-> P-9000B", "P-9000 -SUPPLIED_BY-> Старый",
+        "P-9000B -SUPPLIED_BY-> Новый",
+    ], "refused": False})]
+    assert _answer_errors("Поставщик P-9000 — Старый.", "Кто сейчас поставляет P-9000?", steps)
+    assert not _answer_errors("Поставщик P-9000B — Новый.", "Кто сейчас поставляет P-9000?", steps)
+
+
+def test_mentioning_replacement_does_not_justify_old_recommendation():
+    steps = [ToolStep("search_knowledge", {}, result={"facts": [
+        "P-9000 -REPLACED_BY-> P-9000B",
+    ], "refused": False})]
+    assert _answer_errors("Закажите P-9000. Также существует P-9000B.", "Что заказать вместо P-9000?", steps)
+    assert not _answer_errors("P-9000 снята с производства. Закажите P-9000B.", "Что заказать вместо P-9000?", steps)
+
+
+def test_supplier_reminder_targets_the_final_part():
+    tools = Tools(search_knowledge={"answer": "Описание", "facts": [
+        "P-9000 -REPLACED_BY-> P-9000B", "P-9000 -SUPPLIED_BY-> Старый",
+    ], "refused": False, "sources": []})
+    llm = FakeLLM([
+        call("search_knowledge", question="Кто поставляет P-9000?"),
+        "Поставщик P-9000B неизвестен.",
+        "В базе знаний не найдено.",
+    ])
+    result = run_agent("Кто сейчас поставляет P-9000?", llm, tools.as_dict())
+    assert result.refused
+    assert "Актуальная деталь — P-9000B" in llm.requests[-1]["messages"][-1]["content"]
+
+
+def test_agent_rejects_old_part_before_pending_action():
+    tools = Tools(search_knowledge={"answer": "Описание", "facts": [
+        "AR-210 -HAS_PART-> P-1042", "P-1042 -IS_A-> пусковое реле",
+        "E-17 -INDICATES-> пусковое реле", "P-1042 -REPLACED_BY-> P-1042B",
+    ], "refused": False, "sources": []})
+    llm = FakeLLM([
+        call("search_knowledge", question="Что заказать для AR-210 при E-17?"),
+        call("create_service_order", **{**ORDER, "part_id": "P-1042"}),
+        call("create_service_order", **ORDER),
+    ])
+    result = run_agent("Оформи заказ: 2 штуки для AR-210 при E-17, склад Казань.", llm, tools.as_dict())
+    assert result.steps[1].error and result.pending_action == {"tool": "create_service_order", "args": ORDER}
+    assert tools.count("create_service_order") == 0
+
+
+def test_current_part_requires_enough_model_and_component_evidence():
+    facts = ["BZ-999 -HAS_PART-> P-9000", "P-9000 -IS_A-> контроллер",
+             "BZ-999 -HAS_PART-> P-9900", "P-9900 -IS_A-> контроллер"]
+    assert current_part("Что заказать для BZ-998, узел контроллер?", facts) == (None, [], None)
+    part, _, error = current_part("Что заказать для BZ-999, узел контроллер?", facts)
+    assert part is None and error
