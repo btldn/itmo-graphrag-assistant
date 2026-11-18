@@ -698,3 +698,189 @@ def test_global_does_not_replace_negative_status_question_with_retired_list(kb):
     ])
     answer = global_search("Какие детали Арктики не сняты с производства?", kb, llm)
     assert not answer.refused and answer.text == "P-9000B не снята с производства."
+
+
+@pytest.mark.parametrize("text", [
+    "P-9000: в Москве 8 шт., в Казани 3 шт.",
+    "**P-9000** — Москва: **8 шт.**; Казань: **3 шт.**",
+    "__P-9000__ — Москва: _8 шт._; Казань: _3 шт._",
+    "| Деталь | Склад | Остаток |\n|---|---|---|\n|P-9000|Москва|8|\n|P-9000|Казань|3|",
+])
+def test_stock_cannot_be_swapped_between_warehouses(text):
+    steps = [
+        ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Москва", "qty": 3}),
+        ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Казань", "qty": 8}),
+    ]
+    assert _answer_errors(text, "Проверь остатки P-9000 в Москве и Казани", steps)
+
+
+@pytest.mark.parametrize("text", [
+    "P-9000: в Москве 3 шт., в Казани 8 шт.",
+    "**P-9000** — Москва: **3 шт.**; Казань: **8 шт.**",
+    "__P-9000__ — Москва: _3 шт._; Казань: _8 шт._",
+    "| Деталь | Склад | Остаток |\n|---|---|---|\n|P-9000|Москва|3|\n|P-9000|Казань|8|",
+])
+def test_correct_stock_for_each_warehouse_is_allowed(text):
+    steps = [
+        ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Москва", "qty": 3}),
+        ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Казань", "qty": 8}),
+    ]
+    assert not _answer_errors(text, "Проверь остатки P-9000 в Москве и Казани", steps)
+
+
+@pytest.mark.parametrize("text", [
+    "P-9000 стоит 5000 руб., P-9900 стоит 2630 руб.",
+    "__P-9000__: _5000 руб._; __P-9900__: _2630 руб._",
+    "P-9000 и P-9900 стоят 5000 и 2630 руб. соответственно.",
+    "| Деталь | Цена |\n|---|---|\n|P-9000|5000|\n|P-9900|2630|",
+])
+def test_multiple_parts_cannot_swap_prices_in_prose_or_table(text):
+    steps = [ToolStep("get_price", {}, result={"part_id": "P-9000", "price_rub": 2630}),
+             ToolStep("get_price", {}, result={"part_id": "P-9900", "price_rub": 5000})]
+    assert _answer_errors(text, "Проверь цены P-9000 и P-9900", steps)
+
+
+@pytest.mark.parametrize("text", [
+    "P-9000 стоит 2630 руб., P-9900 стоит 5000 руб.",
+    "__P-9000__: _2630 руб._; __P-9900__: _5000 руб._",
+    "**P-9000**\n- **Цена**: 2 630,00 руб.\n\n**P-9900**\n- Цена: 5000 руб.",
+    "| Деталь | Цена |\n|---|---|\n|P-9000|2630|\n|P-9900|5000|",
+])
+def test_correct_prices_with_explicit_part_binding_are_allowed(text):
+    steps = [ToolStep("get_price", {}, result={"part_id": "P-9000", "price_rub": 2630}),
+             ToolStep("get_price", {}, result={"part_id": "P-9900", "price_rub": 5000})]
+    assert not _answer_errors(text, "Проверь цены P-9000 и P-9900", steps)
+
+
+def test_order_quantity_cannot_confirm_stock():
+    steps = [ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Москва", "qty": 3})]
+    assert _answer_errors("P-9000: остаток 2 шт.", "Закажи 2 шт. P-9000 в Москве", steps)
+    assert not _answer_errors("Закажите 2 шт. P-9000. На складе в Москве 3 шт.",
+                              "Закажи 2 шт. P-9000 в Москве", steps)
+
+
+def test_warehouse_swap_is_corrected_once_in_agent():
+    tools = Tools(check_stock=lambda part_id, warehouse: {
+        "part_id": part_id, "warehouse": warehouse, "qty": 3 if warehouse == "Москва" else 8,
+        "discontinued": False,
+    })
+    correct = "P-9000: в Москве 3 шт., в Казани 8 шт."
+    llm = FakeLLM([
+        call("check_stock", part_id="P-9000", warehouse="Москва"),
+        call("check_stock", part_id="P-9000", warehouse="Казань"),
+        "P-9000: в Москве 8 шт., в Казани 3 шт.", correct,
+    ])
+    result = run_agent("Проверь P-9000 в Москве и Казани", llm, tools.as_dict())
+    assert not result.refused and result.answer == correct and len(llm.requests) == 4
+
+
+def test_quantity_of_created_order_is_not_treated_as_stock():
+    steps = [ToolStep("create_service_order", {}, result={
+        "order_id": "SO-000001", "part_id": "P-9000", "warehouse": "Москва", "qty": 2,
+    })]
+    assert not _answer_errors("Заказ SO-000001 на 2 шт., склад Москва, создан.",
+                              "Закажи 2 шт. P-9000 в Москве", steps)
+
+
+def test_stock_without_warehouse_is_ambiguous_after_two_checks():
+    steps = [
+        ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Москва", "qty": 3}),
+        ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Казань", "qty": 8}),
+    ]
+    assert _answer_errors("P-9000: остаток 3 шт.", "Проверь склады", steps)
+
+
+def test_table_cannot_swap_stock_and_price_columns():
+    steps = [
+        ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Москва", "qty": 3}),
+        ToolStep("get_price", {}, result={"part_id": "P-9000", "price_rub": 2630}),
+    ]
+    template = "| Деталь | Склад | Наличие | Цена |\n|---|---|---|---|\n|P-9000|Москва|{}|{}|"
+    assert _answer_errors(template.format(2630, 3), "Проверь P-9000", steps)
+    assert not _answer_errors(template.format(3, 2630), "Проверь P-9000", steps)
+
+
+def test_replacement_explanation_can_head_price_and_stock_list():
+    steps = [
+        ToolStep("search_knowledge", {}, result={"facts": ["P-9000 -REPLACED_BY-> P-9000B"], "refused": False}),
+        ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Казань", "qty": 2}),
+        ToolStep("check_stock", {}, result={"part_id": "P-9000B", "warehouse": "Казань", "qty": 3}),
+        ToolStep("get_price", {}, result={"part_id": "P-9000B", "price_rub": 2630}),
+    ]
+    text = ("Альтернативная деталь P-9000B — официальная замена для P-9000.\n"
+            "В Казани:\n- Остаток: 3 шт.\n- Цена: 2630 руб.")
+    assert not _answer_errors(text, "Какую замену P-9000 заказать, сколько стоит и есть ли в Казани?", steps)
+    bullets = ("Для замены используется P-9000B:\n- Является заменой для P-9000;\n"
+               "- Доступна в Казани: остаток 3 шт.\n- Цена: 2630 руб.")
+    assert not _answer_errors(bullets, "Какую замену P-9000 заказать, сколько стоит и есть ли в Казани?", steps)
+
+
+def test_specific_component_procedure_cannot_use_overview():
+    tools = Tools(search_knowledge={"answer": "Регламент SP-108.", "facts": [
+        "E-18 -FIXED_BY-> SP-108",
+    ], "sources": ["procedure_SP-108.md"], "refused": False})
+    question = "По какому регламенту устраняют отказ узла вентилятор испарителя?"
+    llm = FakeLLM([call("summarize_topic", question=question), call("search_knowledge", question=question),
+                   "Регламент SP-108."])
+    result = run_agent(question, llm, tools.as_dict())
+    assert tools.count("summarize_topic") == 0 and result.steps[0].error
+    assert result.answer == "Регламент SP-108." and not result.refused
+
+
+def test_direct_price_comparison_uses_erp_instead_of_document_search():
+    tools = Tools(get_price=lambda part_id: {"part_id": part_id,
+                                           "price_rub": 2630 if part_id == "P-1042B" else 6750})
+    question = "Сравни цены P-1042B и P-2054C."
+    llm = FakeLLM([
+        call("search_knowledge", question=question), call("get_price", part_id="P-1042B"),
+        call("get_price", part_id="P-2054C"), "P-1042B: 2630 руб.; P-2054C: 6750 руб.",
+    ])
+    result = run_agent(question, llm, tools.as_dict())
+    assert tools.count("search_knowledge") == 0 and tools.count("get_price") == 2
+    assert result.steps[0].error and not result.refused
+
+
+def test_overview_with_named_component_still_allows_summaries():
+    tools = Tools(summarize_topic={"answer": "Чаще отказывает контроллер.", "sources": [], "refused": False})
+    question = "Сравни, где чаще отказывает контроллер."
+    llm = FakeLLM([call("summarize_topic", question=question), "Чаще отказывает контроллер."])
+    result = run_agent(question, llm, tools.as_dict())
+    assert tools.count("summarize_topic") == 1 and not result.refused
+
+
+def test_numerical_example_is_not_allowed_just_because_stock_matches():
+    steps = [ToolStep("check_stock", {}, result={"part_id": "P-9000", "warehouse": "Москва", "qty": 3})]
+    assert _answer_errors("Например, 3 шт.", "Проверь P-9000 в Москве", steps)
+    assert not _answer_errors("В Москве есть 3 шт. P-9000.", "Проверь P-9000 в Москве", steps)
+
+
+def test_direct_price_query_reminds_about_second_part_once():
+    tools = Tools(get_price=lambda part_id: {"part_id": part_id,
+                                           "price_rub": 2630 if part_id == "P-1042B" else 6750})
+    llm = FakeLLM([
+        call("get_price", part_id="P-1042B"), "P-1042B: 2630 руб.",
+        call("get_price", part_id="P-2054C"), "P-1042B: 2630 руб.; P-2054C: 6750 руб.",
+    ])
+    result = run_agent("Узнай цены P-1042B и P-2054C", llm, tools.as_dict())
+    assert tools.count("get_price") == 2 and not result.refused and len(llm.requests) == 4
+
+
+def test_direct_stock_query_rejects_document_search():
+    tools = Tools()
+    llm = FakeLLM([
+        call("search_knowledge", question="Есть ли P-1042B в Казани?"),
+        call("check_stock", part_id="P-1042B", warehouse="Казань"), "В Казани 3 шт. P-1042B.",
+    ])
+    result = run_agent("Есть ли P-1042B в Казани?", llm, tools.as_dict())
+    assert tools.count("search_knowledge") == 0 and tools.count("check_stock") == 1 and not result.refused
+
+
+def test_numerical_example_gets_one_correction_without_new_tool_calls():
+    tools = Tools()
+    llm = FakeLLM([
+        call("check_stock", part_id="P-1042B", warehouse="Казань"),
+        "Например, 3 шт.", "В Казани есть 3 шт. P-1042B.",
+    ])
+    result = run_agent("Проверь P-1042B в Казани", llm, tools.as_dict())
+    assert not result.refused and "Например" not in result.answer
+    assert tools.count("check_stock") == 1 and len(llm.requests) == 3

@@ -7,13 +7,28 @@ from decimal import Decimal
 
 from assistant.agent.parts import current_part, current_request
 from assistant.agent.tools import TOOL_SCHEMAS
+from assistant.infra.config import vocabulary
 from assistant.infra.erp_client import ErpUnavailable
-from assistant.infra.grounding import code_type, find_codes, normalize_code
+from assistant.infra.grounding import code_type, find_codes, find_names, normalize_code
 from assistant.infra.llm import LLMClient, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
 NUMBER = r"(?<![\w-])(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?:[.,]\d+)?(?![\w-])"
 ERP_FAILURE = "Данные ERP получить не удалось."
+PRICE_WORDS = r"цен|стоим|стоит|стоят|поч[её]м"
+STOCK_WORDS = r"остат|налич|склад|сколько\s+(?:шт|штук)|есть\s+ли"
+
+
+def _route(question: str) -> str | None:
+    """Прямые цены/остатки — ERP; конкретные коды/узлы — local; обзоры не ограничиваем."""
+    codes = find_codes(question)
+    if (codes and all(code_type(code) == "Part" for code in codes)
+            and re.search(f"{PRICE_WORDS}|{STOCK_WORDS}", question, re.IGNORECASE)
+            and not re.search(r"замен|вместо|постав|регламент|оформи|закаж", question, re.IGNORECASE)):
+        return "erp"
+    overview = re.search(r"чаще|частот|статист|больше|сравн|обзор|какие|каких|всех", question, re.IGNORECASE)
+    named_component = any(kind == "Component" for kind, _ in find_names(question, vocabulary()))
+    return "local" if (codes or named_component) and not overview else None
 
 
 def _numbers(text: str) -> set[Decimal]:
@@ -27,6 +42,7 @@ def _numbers(text: str) -> set[Decimal]:
 
 
 def _prices(text: str) -> set[Decimal]:
+    text = re.sub(r"[*`_]", "", text)
     matches = re.findall(rf"({NUMBER})\s*(?:руб\w*|₽)", text, flags=re.IGNORECASE)
     matches += re.findall(rf"(?:цена|стоимость|стоит)\s*[:—-]?\s*({NUMBER})", text, flags=re.IGNORECASE)
     return {number for raw in matches for number in _numbers(raw)}
@@ -34,6 +50,7 @@ def _prices(text: str) -> set[Decimal]:
 
 def _quantities(text: str) -> set[Decimal]:
     """Берёт явно названное количество, а не произвольное число вроде срока доставки."""
+    text = re.sub(r"[*`_]", "", text)
     matches = re.findall(rf"({NUMBER})\s*(?:шт\w*|единиц\w*|детал\w*)", text, flags=re.IGNORECASE)
     matches += re.findall(
         rf"(?:закаж\w*|заказ|остаток|остал(?:ось|ись|ся|ась)|количеств\w*|в\s+наличии)\s*[:—-]?\s*({NUMBER})",
@@ -95,8 +112,113 @@ def _step_evidence(step: ToolStep) -> dict | None:
     return {key: value for key, value in result.items() if key != "sources"}
 
 
+def _facts_from_steps(steps: list[ToolStep]) -> list[str]:
+    facts = []
+    for step in steps:
+        evidence = _step_evidence(step)
+        if evidence:
+            facts.extend(evidence.get("facts", []))
+    return facts
+
+
+def _warehouses(text: str) -> set[str]:
+    patterns = {
+        "Москва": r"\bмоскв[аеуы]\b",
+        "Казань": r"\bказан(?:ь|и)\b",
+        "Новосибирск": r"\bновосибирск(?:е|а)?\b",
+        "Санкт-Петербург": r"\bсанкт[- ]петербург(?:е|а)?\b",
+    }
+    return {name for name, pattern in patterns.items() if re.search(pattern, text, re.IGNORECASE)}
+
+
+def _numeric_errors(text: str, question: str, steps: list[ToolStep]) -> list[str]:
+    """Сверяет простые фразы, списки и таблицы по паре «деталь, склад»."""
+    prices = [step.result for step in steps if step.tool == "get_price" and _step_evidence(step)]
+    stocks = [step.result for step in steps if step.tool == "check_stock" and _step_evidence(step)]
+    orders = [step.result for step in steps if step.tool == "create_service_order" and _step_evidence(step)]
+    all_parts = {row["part_id"] for row in prices + stocks + orders if row.get("part_id")}
+    fragments = []
+    header = {}
+    for line in re.sub(r"[*`_]", "", text).splitlines():
+        if "|" in line:
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            fields = {index: "цена" if re.search(r"цен|стоим", cell, re.IGNORECASE) else "остаток"
+                      for index, cell in enumerate(cells)
+                      if re.search(r"цен|стоим|остат|колич|кол-во|налич", cell, re.IGNORECASE)}
+            if fields:
+                header = fields
+                continue
+            if all(re.fullmatch(r"[: -]+", cell) for cell in cells):
+                continue
+            if header:
+                if max(header) >= len(cells):
+                    return ["Не удалось разобрать числовые столбцы таблицы."]
+                subject = " ".join(cell for index, cell in enumerate(cells) if index not in header)
+                fragments.extend(f"{subject}: {label} {cells[index]}" for index, label in header.items())
+                continue
+        else:
+            header = {}
+        fragments.extend(re.split(r";|(?<=[.!?])\s+|,\s*(?=(?:P-\d{4}|(?:в\s+)?(?:Москв|Казан|Санкт|Новосибирск)))",
+                                  line, flags=re.IGNORECASE))
+    part = None
+    warehouse = None
+    facts = _facts_from_steps(steps)
+    replacement, _, _ = current_part(question, facts) if current_request(question) else (None, [], None)
+    for fragment in fragments:
+        price_values = _prices(fragment)
+        qty_values = _quantities(fragment)
+        has_numbers = bool(price_values or qty_values)
+        named = {code for code in find_codes(fragment) if code_type(code) == "Part"}
+        if named:
+            new_part = next(iter(named)) if len(named) == 1 else None
+            if len(named) > 1 and replacement in named and not has_numbers:
+                # Заголовок может объяснять замену: «P-...B вместо P-...», без числовых утверждений.
+                new_part = replacement
+            if (part == replacement and not has_numbers
+                    and re.search(r"замен|предшеств|раньше|ранее", fragment, re.IGNORECASE)):
+                # Пояснение «является заменой для старой P-...» не меняет заголовок списка.
+                new_part = replacement
+            if new_part != part:
+                warehouse = None
+            part = new_part
+        places = _warehouses(fragment)
+        if places:
+            warehouse = next(iter(places)) if len(places) == 1 else None
+        if not has_numbers:
+            continue
+        if len(named) > 1 or len(places) > 1:
+            return ["Неоднозначная привязка чисел: укажи каждую деталь и склад отдельной строкой."]
+        selected_part = part or (next(iter(all_parts)) if len(all_parts) == 1 else None)
+        if selected_part is None:
+            return ["Неясно, к какой детали относятся цена или остаток. "
+                    "Укажи код детали в каждой строке ответа/таблицы."]
+        if price_values:
+            confirmed = {number for row in prices if row.get("part_id") == selected_part
+                         for number in _numbers(str(row.get("price_rub", "")))}
+            if price_values - confirmed:
+                return ["Цена не подтверждена для указанной детали."]
+        if qty_values:
+            ordering = re.search(r"закаж|заказ|нужно|требуется", fragment, re.IGNORECASE)
+            stock_claim = re.search(r"остат|остал|налич|есть", fragment, re.IGNORECASE)
+            if ordering and not stock_claim:
+                if qty_values - _quantities(question):
+                    return ["Количество заказа не подтверждено вопросом."]
+                continue
+            rows = [row for row in stocks if row.get("part_id") == selected_part]
+            known_places = {row.get("warehouse") for row in rows}
+            selected_place = warehouse or (next(iter(known_places)) if len(known_places) == 1 else None)
+            if selected_place is None and len(known_places) > 1:
+                return ["Неясно, к какому складу относится остаток."]
+            confirmed = {number for row in rows if row.get("warehouse") == selected_place
+                         for number in _numbers(str(row.get("qty", "")))}
+            if qty_values - confirmed:
+                return ["Остаток не подтверждён для указанной детали и склада."]
+    return []
+
+
 def _answer_errors(text: str, question: str, steps: list[ToolStep]) -> list[str]:
     """Сверяет коды и числа с вопросом и результатами, исключая ошибки и источники."""
+    text = re.sub(r"[*`_]", "", text)
     results = []
     for step in steps:
         result = _step_evidence(step)
@@ -122,6 +244,9 @@ def _answer_errors(text: str, question: str, steps: list[ToolStep]) -> list[str]
         errors.append("Цена не подтверждена данными о цене.")
     if _quantities(text) - quantities:
         errors.append("Количество не подтверждено данными о количестве.")
+    examples = re.findall(rf"(?:например|к примеру)\s*[:,(]?\s*({NUMBER})", text, re.IGNORECASE)
+    if any(_numbers(example) - _numbers(question) for example in examples):
+        errors.append("Не добавляй числовые примеры, которых пользователь не называл.")
     if re.search(r"какие.*детал", question, re.IGNORECASE) and re.search(r"снят", question, re.IGNORECASE):
         listed = {code for step in steps if step.tool == "summarize_topic" and not step.error
                   and step.result and not step.result.get("refused")
@@ -148,24 +273,7 @@ def _answer_errors(text: str, question: str, steps: list[ToolStep]) -> list[str]
                 name.lower() in text.lower() for name in suppliers
             ):
                 errors.append(f"Поставщик актуальной детали {part} не подтверждён.")
-    # В простом предложении с одной деталью числа должны относиться именно к ней.
-    for sentence in re.split(r"[;\n]|(?<=[.!?])\s+", text):
-        parts = {code for code in find_codes(sentence) if code.startswith("P-")}
-        if len(parts) != 1:
-            continue
-        part = next(iter(parts))
-        part_results = [result for result in results if result.get("part_id") == part]
-        for field, values in (("price_rub", _prices(sentence)), ("qty", _quantities(sentence))):
-            if not values:
-                continue
-            confirmed = set()
-            for result in part_results:
-                confirmed.update(_numbers(str(result.get(field, ""))))
-            for statement in re.split(r"[;\n]|(?<=[.!?])\s+", question):
-                if {code for code in find_codes(statement) if code.startswith("P-")} == {part}:
-                    confirmed.update(_prices(statement) if field == "price_rub" else _quantities(statement))
-            if values - confirmed:
-                errors.append("Цена или количество не подтверждены для указанной детали.")
+    errors.extend(_numeric_errors(text, question, steps))
     if set(re.findall(r"\bSO-\d+\b", text)) - set(re.findall(r"\bSO-\d+\b", evidence)):
         errors.append("Номер заказа не подтверждён.")
     created = any(step.tool == "create_service_order" and step.error is None
@@ -215,7 +323,9 @@ def _finish(text: str, question: str, steps: list[ToolStep], messages: list[dict
             refused = "не найдено" in text.lower() or not has_data
             return AgentResult(text, steps=steps, sources=sorted(sources), refused=refused)
         if attempt == 0:
-            messages.append({"role": "user", "content": "Исправь ответ по данным инструментов. " + " ".join(errors)})
+            messages.append({"role": "user", "content": "Исправь ответ по данным инструментов. " + " ".join(errors)
+                             + " Не добавляй числовых примеров и номеров строк фактов. "
+                             "Если нужно количество заказа, спроси без примера с цифрами."})
             response = llm.chat(messages)
             messages.append(response.as_message())
             text = response.content
@@ -225,6 +335,33 @@ def _finish(text: str, question: str, steps: list[ToolStep], messages: list[dict
     if any(step.error == ERP_FAILURE for step in steps):
         text += "\n" + ERP_FAILURE
     return AgentResult(text, steps=steps, sources=sorted(sources), refused=True)
+
+
+def _missing_erp_checks(question: str, steps: list[ToolStep]) -> list[str]:
+    checks = []
+    if re.search(PRICE_WORDS, question, re.IGNORECASE):
+        checks.append(("get_price", None))
+    if re.search(STOCK_WORDS, question, re.IGNORECASE):
+        for warehouse in _warehouses(question) or {None}:
+            checks.append(("check_stock", warehouse))
+
+    missing = []
+    for code in find_codes(question):
+        for tool, warehouse in checks:
+            done = any(
+                step.tool == tool
+                and step.args.get("part_id") == code
+                and (warehouse is None or step.args.get("warehouse") == warehouse)
+                and step.result
+                and (not step.error or "ERP" in step.error)
+                for step in steps
+            )
+            if not done:
+                label = f"{tool} для {code}"
+                if warehouse:
+                    label += f", склад {warehouse}"
+                missing.append(label)
+    return missing
 
 
 def run_agent(
@@ -280,15 +417,32 @@ def run_agent(
     price_reminder_sent = False
     supplier_reminder_sent = False
     current_reminder_sent = False
-    specific_question = bool(find_codes(question)) and not re.search(
-        r"чаще|больше|сравн|какие|каких|всех", question, flags=re.IGNORECASE
-    )
+    route = _route(question)
+    specific_question = route in ("local", "erp")
+    if route == "erp":
+        messages[0]["content"] += (
+            " Это прямой запрос ERP: проверь каждую названную деталь через get_price/check_stock. "
+            "В таблице указывай код детали и склад для остатка."
+        )
+    elif route == "local" and re.search(r"регламент|процедур", question, re.IGNORECASE):
+        messages[0]["content"] += (
+            " Нужен именно регламент, а не замена детали: вызови search_knowledge с исходным вопросом целиком."
+        )
     while len(steps) < max_steps:
         response = llm.chat(messages, tools=TOOL_SCHEMAS)
         messages.append(response.as_message())
         if not response.tool_calls:
-            facts = [fact for step in steps if (evidence := _step_evidence(step))
-                     for fact in evidence.get("facts", [])]
+            if (route == "erp" and not lookup_reminder_sent
+                    and not any(step.error and step.tool not in ("search_knowledge", "summarize_topic")
+                                for step in steps)):
+                missing = _missing_erp_checks(question, steps)
+                if missing:
+                    lookup_reminder_sent = True
+                    messages.append({"role": "user", "content": "Прямой запрос ERP ещё не выполнен: "
+                                     + "; ".join(missing) + ". Не ищи эти цены/остатки в документах. "
+                                     "Если склад не указан, спроси его, не выбирай сам."})
+                    continue
+            facts = _facts_from_steps(steps)
             part, suppliers, problem = current_part(question, facts)
             mentioned = {code for code in find_codes(response.content) if code_type(code) == "Part"}
             if current_request(question) and part and mentioned and part not in mentioned and not current_reminder_sent:
@@ -371,8 +525,10 @@ def run_agent(
                 error = "Неизвестный инструмент. Выбери один из описанных инструментов."
             else:
                 error = _argument_error(arguments, schemas[call.name])
-            if error is None and call.name == "summarize_topic" and specific_question:
+            if error is None and call.name == "summarize_topic" and route == "local":
                 error = "Вопрос о конкретном коде: используй search_knowledge, а не обзор summarize_topic."
+            if error is None and route == "erp" and call.name in ("search_knowledge", "summarize_topic"):
+                error = "Прямой запрос ERP: используй get_price/check_stock для каждой названной детали."
             if error is None and "part_id" in arguments and arguments["part_id"] not in known_codes:
                 error = "Номер детали не подтверждён. Сначала вызови search_knowledge."
             if error is None and "model" in arguments and set(find_codes(arguments["model"])) - known_codes:
@@ -381,8 +537,7 @@ def run_agent(
                 model = arguments["model"]
                 if re.fullmatch(r"(?:AR|BZ|GS)-[0-9]{3}", model) is None or model not in find_codes(question):
                     error = "Для заказа пользователь должен указать код модели оборудования в исходном вопросе."
-                facts = [fact for previous in steps[:-1] if (evidence := _step_evidence(previous))
-                         for fact in evidence.get("facts", [])]
+                facts = _facts_from_steps(steps[:-1])
                 part, _, problem = current_part(question, facts)
                 if problem:
                     error = problem
