@@ -31,6 +31,7 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
     Все числа считает код по весам рёбер и передаёт модели готовыми. Модель их только формулирует.
     """
     facts = []
+    replacements = []
     failures_by_model = Counter()
     failures_by_component = Counter()
     failures_by_line = Counter()
@@ -64,6 +65,24 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
         if attrs["type"] == "FAILED":
             fact += f"; отказов {attrs['weight']}"
         facts.append(fact)
+        if attrs["type"] == "REPLACED_BY":
+            # В data.md этот тип явно означает снятие старой детали с производства.
+            pending = [source]
+            visited = set()
+            lines = set()
+            while pending:
+                node = pending.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                for parent, _, incoming in graph.in_edges(node, data=True):
+                    if incoming["type"] == "REPLACED_BY":
+                        pending.append(parent)
+                    elif incoming["type"] == "HAS_PART":
+                        lines.update(graph.nodes[line]["name"] for _, line, edge in graph.out_edges(parent, data=True)
+                                     if edge["type"] == "BELONGS_TO")
+            label = ", ".join(sorted(lines)) or "линейка не указана"
+            replacements.append(f"{label}: {source_name} снята с производства; замена {target_name}")
         if attrs["type"] == "FAILED":
             for line in model_lines[source]:
                 failures_by_line[line] += attrs["weight"]
@@ -86,6 +105,7 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
                     "Напиши сводку сообщества графа знаний не длиннее 150 слов. "
                     "Опиши только основные сущности, связи и замены деталей. "
                     "Статистику в текст не включай: программа добавит её точно после твоего ответа. "
+                    "Статусы снятия с производства и замены тоже добавит программа по REPLACED_BY. "
                     "Все числа уже посчитаны кодом: используй их без пересчёта и выдумок. "
                     "Сохрани численность отказов по линейкам, моделям и узлам, если она дана. "
                     "Это статистика части графа, поэтому не объявляй её итогом по всему корпусу. "
@@ -111,13 +131,14 @@ def summarize_community(community: Community, graph: nx.DiGraph, llm: LLMClient)
             },
         ]
     )
-    # Числовая часть не зависит от того, насколько точно модель пересказала числа.
-    # Убираем её попытки повторить статистику; оставляем описание сущностей и связей.
+    # Статистику отказов берём из графа, поэтому убираем её пересказ моделью.
     description = []
     for sentence in re.split(r"[.!?\n]+", response.content):
-        if re.search(r"отказ|статистик|(?<![\w-])\d+(?![\w-])", sentence, flags=re.IGNORECASE):
+        if re.search(r"отказ|статистик|снят|замен|(?<![\w-])\d+(?![\w-])", sentence, flags=re.IGNORECASE):
             continue
         if sentence.strip():
             description.append(sentence.strip())
     exact = "Статистика части графа: " + "; ".join(statistics) if statistics else "В этой группе нет данных об отказах"
+    if replacements:
+        exact += ". Замены по схеме REPLACED_BY: " + "; ".join(replacements)
     return " ".join((exact + ". " + ". ".join(description)).split()[:150])

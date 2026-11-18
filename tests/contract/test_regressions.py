@@ -546,3 +546,155 @@ def test_current_part_requires_enough_model_and_component_evidence():
     assert current_part("Что заказать для BZ-998, узел контроллер?", facts) == (None, [], None)
     part, _, error = current_part("Что заказать для BZ-999, узел контроллер?", facts)
     assert part is None and error
+
+
+def test_global_drops_positive_score_with_only_missing_information(kb):
+    llm = FakeLLM([
+        '{"answer":"В сводке не указано, что детали сняты с производства.","score":2}',
+        '{"answer":"Нет информации о производстве.","score":4}',
+    ])
+    answer = global_search("Какие детали сняты с производства?", kb, llm)
+    assert answer.refused and len(llm.requests) == 2
+
+
+def test_global_reduce_receives_statistics_supporting_short_map_answer(kb):
+    kb.communities[0].summary = "Арктика: узел пусковое реле, отказов 6; Арктика: узел контроллер, отказов 1."
+    llm = FakeLLM([
+        '{"answer":"узел пусковое реле","score":10}', '{"answer":"нет","score":0}',
+        "В Арктике чаще всего отказывает пусковое реле.",
+    ])
+    answer = global_search("Какой узел чаще всего отказывает в Арктике?", kb, llm)
+    assert not answer.refused and len(llm.requests) == 3
+    assert "отказов 6" in llm.requests[-1]["messages"][-1]["content"]
+
+
+def test_global_does_not_convert_missing_data_into_negative_status(kb):
+    kb.communities[0].summary = "Деталь P-1042 снята с производства и заменена на P-1042B."
+    llm = FakeLLM([
+        '{"answer":"P-1042 снята с производства, замена P-1042B.","score":10}',
+        '{"answer":"нет","score":0}', "P-1042 не снята с производства.",
+    ])
+    answer = global_search("Какая деталь снята с производства?", kb, llm)
+    assert answer.refused and "не снята" not in answer.text
+
+
+def test_summary_preserves_discontinued_status_and_product_line(graph):
+    text = summarize_community(Community(0, sorted(graph.nodes)), graph, FakeLLM(["Описание графа."]))
+    assert "P-1042" in text and "P-1042B" in text and "снята с производства" in text
+    assert "Арктика" in text and len(text.split()) <= 150
+
+
+def test_global_keeps_a_useful_fact_with_a_missing_data_caveat(kb):
+    kb.communities[0].summary = "Пусковое реле отказывает чаще других узлов."
+    llm = FakeLLM([
+        '{"answer":"Чаще отказывает пусковое реле. По другим линейкам нет данных.","score":8}',
+        '{"answer":"нет","score":0}', "Чаще отказывает пусковое реле.",
+    ])
+    answer = global_search("Какой узел чаще отказывает?", kb, llm)
+    assert not answer.refused and len(llm.requests) == 3
+
+
+def test_global_preserves_partial_information_if_reduce_refuses(kb):
+    llm = FakeLLM([
+        '{"answer":"Пусковое реле отказывает чаще.","score":10}', '{"answer":"нет","score":0}',
+        "В базе знаний не найдено.",
+    ])
+    answer = global_search("Какой узел чаще отказывает?", kb, llm)
+    assert answer.refused and "Пусковое реле" in answer.text and len(llm.requests) == 3
+
+
+def test_global_keeps_fact_and_caveat_in_same_sentence(kb):
+    llm = FakeLLM([
+        '{"answer":"Чаще отказывает пусковое реле, но нет данных о других линейках.","score":8}',
+        '{"answer":"нет","score":0}', "Чаще отказывает пусковое реле.",
+    ])
+    answer = global_search("Какой узел чаще отказывает?", kb, llm)
+    assert not answer.refused and len(llm.requests) == 3
+
+
+def test_global_allows_explicitly_supported_negative_status(kb):
+    kb.communities[0].summary = "P-1042B не снята с производства."
+    llm = FakeLLM([
+        '{"answer":"P-1042B не снята с производства.","score":8}', '{"answer":"нет","score":0}',
+        "P-1042B не снята с производства.",
+    ])
+    answer = global_search("Снята ли P-1042B с производства?", kb, llm)
+    assert not answer.refused
+
+
+def test_map_cannot_invent_negative_status_before_reduce(kb):
+    kb.communities[0].summary = "P-1042 снята с производства, замена P-1042B."
+    llm = FakeLLM([
+        '{"answer":"P-1042 не снята с производства.","score":10}', '{"answer":"нет","score":0}',
+    ])
+    answer = global_search("Снята ли P-1042 с производства?", kb, llm)
+    assert answer.refused and len(llm.requests) == 2
+
+
+def test_summary_model_cannot_override_exact_discontinued_status(graph):
+    text = summarize_community(Community(0, sorted(graph.nodes)), graph,
+                               FakeLLM(["P-1042 не снята с производства. P-1042 заменена на P-7777."]))
+    assert "не снята" not in text and "P-7777" not in text
+    assert "P-1042 снята с производства" in text and "P-1042B" in text
+
+
+def test_agent_cannot_drop_a_part_from_discontinued_list():
+    steps = [ToolStep("summarize_topic", {}, result={
+        "answer": "Сняты P-9000, P-9000B и P-9900.", "refused": False,
+    })]
+    assert _answer_errors("Сняты P-9000 и P-9900.", "Какие детали сняты с производства?", steps)
+    assert not _answer_errors("Сняты P-9000, P-9000B и P-9900.", "Какие детали сняты с производства?", steps)
+
+
+def test_global_cannot_claim_it_created_an_order(kb):
+    llm = FakeLLM([
+        '{"answer":"Узел пусковое реле.","score":8}', '{"answer":"нет","score":0}',
+        "Заказ оформлен.",
+    ])
+    answer = global_search("Оформи заказ", kb, llm)
+    assert answer.refused and "оформлен" not in answer.text
+
+
+def test_global_ignores_a_map_answer_about_another_component(kb):
+    llm = FakeLLM([
+        '{"answer":"Отказывает датчик температуры. Об остальных узлах нет данных.","score":8}',
+        '{"answer":"Пусковое реле.","score":10}', "Пусковое реле.",
+    ])
+    answer = global_search("Что известно про пусковое реле?", kb, llm)
+    assert not answer.refused
+    assert "Отказывает датчик температуры" not in llm.requests[-1]["messages"][-1]["content"]
+
+
+def test_global_retains_every_exact_retired_part_for_requested_line(kb):
+    kb.communities[0].summary = (
+        "Арктика: P-9000 снята с производства; замена P-9000B; "
+        "Арктика: P-9000B снята с производства; замена P-9000C; "
+        "Бриз: P-9900 снята с производства; замена P-9900B."
+    )
+    llm = FakeLLM([
+        '{"answer":"Снята P-9000.","score":10}', '{"answer":"нет","score":0}', "Снята P-9000.",
+    ])
+    answer = global_search("Какие детали линейки Арктика сняты с производства?", kb, llm)
+    assert not answer.refused and "P-9000B" in answer.text and "P-9900" not in answer.text
+    assert len(llm.requests) == 3
+
+
+def test_global_drops_wrong_fan_even_with_caveat_about_requested_fan(kb):
+    kb.vocabulary["Component"] += ["вентилятор испарителя", "вентилятор конденсатора"]
+    llm = FakeLLM([
+        '{"answer":"Ошибка указывает на неисправность вентилятора конденсатора. '
+        'Однако в сводке не указано, что относится к вентилятору испарителя, но не связан с регламентом.","score":8}',
+        '{"answer":"нет","score":0}',
+    ])
+    answer = global_search("Регламент для узла вентилятор испарителя?", kb, llm)
+    assert answer.refused and len(llm.requests) == 2
+
+
+def test_global_does_not_replace_negative_status_question_with_retired_list(kb):
+    kb.communities[0].summary = "Арктика: P-9000 снята с производства. P-9000B не снята с производства."
+    llm = FakeLLM([
+        '{"answer":"P-9000B не снята с производства.","score":8}', '{"answer":"нет","score":0}',
+        "P-9000B не снята с производства.",
+    ])
+    answer = global_search("Какие детали Арктики не сняты с производства?", kb, llm)
+    assert not answer.refused and answer.text == "P-9000B не снята с производства."

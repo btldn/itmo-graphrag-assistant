@@ -1,6 +1,7 @@
 """Два режима поиска по графу. Требования FR-4, FR-5 и FR-10."""
 
 import json
+import re
 from itertools import combinations, pairwise
 
 import networkx as nx
@@ -121,6 +122,16 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     return Answer(text, sources=sorted(sources), facts=facts, refused="не найдено" in text.lower())
 
 
+def _no_data_only(text: str) -> bool:
+    """Отбрасывает сообщения только об отсутствии данных, сохраняя смешанные ответы."""
+    sentences = [part.strip() for part in re.split(r"[.!?\n]+|,\s+(?:но|однако)\s+", text) if part.strip()]
+    return bool(sentences) and all(re.search(
+        r"не указан|не найден|не содерж|не связан|нет (?:данных|информации|сведений)"
+        r"|недостаточно (?:данных|информации)",
+        sentence, re.IGNORECASE,
+    ) for sentence in sentences)
+
+
 def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     """Отвечает на обзорный вопрос по сводкам сообществ в два шага.
 
@@ -128,7 +139,10 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     Шаг reduce: частичные ответы с оценкой выше 0 объединяются в итоговый ответ.
     Если таких ответов нет, возвращается `Answer(..., refused=True)`.
     """
+    asked_components = {name for kind, name in find_names(question, kb.vocabulary) if kind == "Component"}
+    negative_status = r"не\s+снят[аоы]?\s+с\s+производства"
     partial_answers = []
+    supporting_summaries = []
     sources = set()
     for community in kb.communities:
         if not community.summary.strip():
@@ -142,6 +156,10 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
                         "частичный ответ, score — целая оценка полезности от 0 до 10. "
                         "Если данных для вопроса нет, поставь 0. Сохрани относящиеся к вопросу "
                         "коды и числа. Не выдавай сведения одной группы за итог по всему корпусу."
+                        " Сохраняй линейку, узел и число отказов вместе. "
+                        "По схеме проекта REPLACED_BY означает: старая деталь снята с производства и заменена. "
+                        "Если ответ сообщает только об отсутствии данных, score должен быть 0. "
+                        "Отсутствие информации не доказывает, что деталь не снята с производства."
                     ),
                 },
                 {"role": "user", "content": f"Сводка:\n{community.summary}\n\nВопрос: {question}"},
@@ -159,7 +177,22 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
             continue
         if set(find_codes(text)) - set(find_codes(question + "\n" + community.summary)):
             continue
+        if _no_data_only(text):
+            continue
+        useful_text = " ".join(sentence for sentence in re.split(r"[.!?\n]+", text) if not _no_data_only(sentence))
+        answered_components = {name for kind, name in find_names(useful_text, kb.vocabulary) if kind == "Component"}
+        answered_components.update(
+            name for name in kb.vocabulary.get("Component", [])
+            if all(re.search(rf"\b{re.escape(word)}\w*", useful_text, re.IGNORECASE) for word in name.split())
+        )
+        if asked_components and answered_components and asked_components.isdisjoint(answered_components):
+            continue
+        if re.search(negative_status, text, re.IGNORECASE) and not re.search(
+            negative_status, community.summary, re.IGNORECASE
+        ):
+            continue
         partial_answers.append(text.strip())
+        supporting_summaries.append(community.summary)
         for node in community.nodes:
             for chunk_id in kb.graph.nodes[node]["sources"]:
                 sources.add(chunk_id.split("#", 1)[0])
@@ -181,18 +214,45 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
                     "Не придумывай факты, цены и остатки. "
                     "Отсутствие сведений в других группах не отменяет полезный ответ. "
                     "Если передан единственный полезный ответ и он отвечает на вопрос, сохрани его. "
+                    "Подтверждающие сводки сохраняют контекст и числа: сверяй с ними краткие ответы. "
+                    "Не превращай отсутствие информации в отрицательный факт. "
+                    "Связь REPLACED_BY означает снятие старой детали с производства и её замену. "
+                    "Ты только ищешь документы: не создаёшь и не подтверждаешь заказы. "
                     "Если данных недостаточно, напиши: «В базе знаний не найдено.»"
                 ),
             },
             {
                 "role": "user",
                 "content": "Полезные ответы:\n" + "\n\n".join(partial_answers) + "\n\nВопрос: " + question
+                + "\n\nПодтверждающие сводки:\n" + "\n\n".join(supporting_summaries)
                 + "\nСформулируй ответ, сохранив найденные факты. Не требуй ответов от остальных групп.",
             },
         ]
     )
     text = response.content.strip() or "В базе знаний не найдено."
-    if set(find_codes(text)) - set(find_codes(question + "\n" + "\n".join(partial_answers))):
+    retired = set()
+    if (re.search(r"детал", question, re.IGNORECASE) and re.search(r"снят", question, re.IGNORECASE)
+            and not re.search(r"не\s+снят", question, re.IGNORECASE)):
+        lines = [name for kind, name in find_names(question, kb.vocabulary) if kind == "ProductLine"]
+        for summary in supporting_summaries:
+            for line in lines:
+                retired.update(re.findall(rf"{re.escape(line)}:\s*(P-\d{{4}}[A-Z]?) снята с производства", summary))
+        if retired - set(find_codes(text)):
+            # Это точные статусы, добавленные кодом в сводки, а не догадки по score.
+            text = "По подтверждающим сводкам сняты с производства: " + ", ".join(sorted(retired)) + "."
+    if re.search(r"\bзаказ[^.!?\n]*\b(?:создан|оформлен|подтвержд[её]н)\b", text, re.IGNORECASE):
+        return Answer("Поиск по сводкам не создаёт заказы. Для подготовки заказа нужен режим агента.",
+                      sources=sorted(sources), refused=True)
+    support = "\n".join(partial_answers + supporting_summaries)
+    if re.search(negative_status, text, re.IGNORECASE) and not re.search(negative_status, support, re.IGNORECASE):
+        return Answer("В базе знаний не найдено подтверждения отрицательного статуса детали.",
+                      sources=sorted(sources), refused=True)
+    if _no_data_only(text):
+        # Полезные сведения не скрываем, но полноту ответа не объявляем доказанной.
+        return Answer("В базе знаний не найдено полного подтверждённого ответа. "
+                      "Найденные частичные сведения: " + " ".join(partial_answers),
+                      sources=sorted(sources), refused=True)
+    if set(find_codes(text)) - (set(find_codes(question + "\n" + "\n".join(partial_answers))) | retired):
         return Answer("В базе знаний не найдено: ответ содержит неподтверждённый код.",
                       sources=sorted(sources), refused=True)
     return Answer(text, sources=sorted(sources), refused="не найдено" in text.lower())
