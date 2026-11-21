@@ -5,8 +5,8 @@ import re
 from collections.abc import Callable
 from decimal import Decimal
 
-from assistant.agent.parts import current_part, current_request
 from assistant.agent.tools import TOOL_SCHEMAS
+from assistant.graphrag.parts import current_part, current_request
 from assistant.infra.config import vocabulary
 from assistant.infra.erp_client import ErpUnavailable
 from assistant.infra.grounding import code_type, find_codes, find_names, normalize_code
@@ -575,6 +575,8 @@ def run_agent(
                 known_codes.update(find_codes(json.dumps(evidence, ensure_ascii=False)))
 
     learned = []
+    erp_facts = []
+    part, _, _ = current_part(question, _facts_from_steps(steps)) if current_request(question) else (None, [], None)
     for step in steps:
         if step.error or not step.result:
             continue
@@ -585,12 +587,19 @@ def run_agent(
                 learned.extend(evidence["facts"])
         elif result.get("answer"):
             learned.append(result["answer"])
-        if "price_rub" in result:
-            learned.append(f"{result['part_id']}: цена {result['price_rub']} руб.")
+        if part and result.get("part_id") != part:
+            continue
+        if step.tool == "get_price" and "price_rub" in result:
+            erp_facts.append(f"{result['part_id']}: цена {result['price_rub']} руб.")
         if step.tool == "check_stock" and "qty" in result:
-            learned.append(f"{result['part_id']}: на складе {result['warehouse']} {result['qty']} шт.")
-    text = "\n".join(dict.fromkeys(learned))
+            erp_facts.append(f"{result['part_id']}: на складе {result['warehouse']} {result['qty']} шт.")
+    if part and erp_facts:
+        learned = [f"Актуальная деталь: {part}."]
+    text = "\n".join(dict.fromkeys(learned + erp_facts))
     result = _finish(text, question, steps, messages, llm)
+    missing = [fact for fact in dict.fromkeys(erp_facts) if fact not in result.answer.splitlines()]
+    if missing:
+        result.answer += "\n" + "\n".join(missing)
     # Факт остановки определяет код, поэтому модель не может убрать его при коррекции.
     result.answer += "\nРабота прервана: достигнут лимит вызовов инструментов."
     return result

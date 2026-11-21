@@ -6,9 +6,18 @@ from itertools import combinations, pairwise
 
 import networkx as nx
 
+from assistant.graphrag.parts import current_part, current_request
 from assistant.infra.grounding import code_type, find_codes, find_names
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import MAP_SCHEMA, Answer, KnowledgeBase
+
+AMOUNT = r"\d+(?:[ \u00a0\u202f]\d{3})*(?:[.,]\d+)?"
+ERP_AMOUNT = re.compile(
+    rf"\b{AMOUNT}\s*(?:руб\w*|₽)"
+    rf"|\b(?:цен[аы]|стоимость|стоит|остаток|остал(?:ось|ись|ся|ась)|в\s+наличии)\s*[:=—-]?\s*{AMOUNT}"
+    rf"|\b(?:есть|доступно|на\s+складе[^.!?\n]*?)\s+{AMOUNT}\s*(?:шт\w*|единиц\w*|детал\w*)",
+    re.IGNORECASE,
+)
 
 
 def _select_edges(graph: nx.DiGraph, anchors: list[str]) -> set[tuple[str, str]]:
@@ -119,7 +128,26 @@ def local_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
     if set(find_codes(text)) - set(find_codes(question + "\n" + "\n".join(facts))):
         return Answer("В базе знаний не найдено: ответ содержит неподтверждённый код.",
                       sources=sorted(sources), facts=facts, refused=True)
-    return Answer(text, sources=sorted(sources), facts=facts, refused="не найдено" in text.lower())
+    if ERP_AMOUNT.search(re.sub(r"[*`_]", "", text)):
+        return Answer("В базе знаний не найдено цены или остатка. Эти данные нужно проверить в ERP.",
+                      sources=sorted(sources), facts=facts, refused=True)
+    refused = "не найдено" in text.lower()
+    if not refused and current_request(question) and any(" -REPLACED_BY-> " in fact for fact in facts):
+        part, _, problem = current_part(question, facts)
+        mentioned = {code for code in find_codes(text) if code_type(code) == "Part"}
+        recommends_order = re.search(r"зака[зж]|рекоменд|какую\s+деталь", question, re.IGNORECASE)
+        if (mentioned or recommends_order) and (problem or (part and part not in mentioned)):
+            return Answer("В базе знаний не найдено подтверждения предложенной замены.",
+                          sources=sorted(sources), facts=facts, refused=True)
+        if part:
+            for sentence in re.split(r"[;\n]|(?<=[.!?])\s+", text):
+                parts = {code for code in find_codes(sentence) if code_type(code) == "Part"}
+                recommendation = re.search(r"закаж|заказать|рекоменд|нужн", sentence, re.IGNORECASE)
+                history = re.search(r"снят|ранее|раньше|предшествен|заменена|не\s+.*заказ", sentence, re.IGNORECASE)
+                if parts and part not in parts and recommendation and not history:
+                    return Answer("В базе знаний не найдено подтверждения предложенной замены.",
+                                  sources=sorted(sources), facts=facts, refused=True)
+    return Answer(text, sources=sorted(sources), facts=facts, refused=refused)
 
 
 def _no_data_only(text: str) -> bool:
