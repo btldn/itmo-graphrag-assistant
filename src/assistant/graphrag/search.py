@@ -203,6 +203,8 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
         text, score = data.get("answer"), data.get("score")
         if not isinstance(text, str) or not text.strip() or type(score) is not int or not 0 < score <= 10:
             continue
+        if ERP_AMOUNT.search(re.sub(r"[*`_]", "", text)):
+            continue
         if set(find_codes(text)) - set(find_codes(question + "\n" + community.summary)):
             continue
         if _no_data_only(text):
@@ -270,6 +272,9 @@ def global_search(question: str, kb: KnowledgeBase, llm: LLMClient) -> Answer:
             text = "По подтверждающим сводкам сняты с производства: " + ", ".join(sorted(retired)) + "."
     if re.search(r"\bзаказ[^.!?\n]*\b(?:создан|оформлен|подтвержд[её]н)\b", text, re.IGNORECASE):
         return Answer("Поиск по сводкам не создаёт заказы. Для подготовки заказа нужен режим агента.",
+                      sources=sorted(sources), refused=True)
+    if ERP_AMOUNT.search(re.sub(r"[*`_]", "", text)):
+        return Answer("В базе знаний не найдено цены или остатка. Эти данные нужно проверить в ERP.",
                       sources=sorted(sources), refused=True)
     support = "\n".join(partial_answers + supporting_summaries)
     if re.search(negative_status, text, re.IGNORECASE) and not re.search(negative_status, support, re.IGNORECASE):
